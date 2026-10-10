@@ -35,7 +35,7 @@ export default function App() {
             </div>
             <div>
               <p className="display font-semibold text-sm leading-tight" style={{ color: 'var(--ink)' }}>
-                Arc A2A
+                Nexus A2A
               </p>
               <p className="text-[10px] uppercase font-semibold tracking-widest" style={{ color: 'var(--accent)', letterSpacing: '0.1em' }}>
                 Agent Pipeline
@@ -72,7 +72,7 @@ export default function App() {
       {/* ── Footer ─────────────────────────────────────────────── */}
       <footer className="max-w-4xl mx-auto w-full px-4 pb-6">
         <p className="text-center text-[11px]" style={{ color: 'var(--subtle)' }}>
-          Arc A2A · USDC escrow &amp; agent-to-agent payments on Arc Testnet ·{' '}
+          Nexus A2A · USDC escrow &amp; agent-to-agent payments on Arc Testnet ·{' '}
           <a
             href="https://explorer.testnet.arc.io/address/0x6e0185f92dde0b2d8793bb286913445a2f27a49a"
             target="_blank" rel="noreferrer"

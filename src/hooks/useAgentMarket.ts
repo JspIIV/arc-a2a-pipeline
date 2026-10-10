@@ -2,7 +2,7 @@ import { useReadContract } from 'wagmi'
 import { AGENT_MARKET } from '../contracts'
 import { ARC_CHAIN_ID } from '../config'
 
-// ── Read hooks only — A2A pipeline ────────────────────────────────
+// ── Read hooks — A2A pipeline ────────────────────────────────────────
 
 export function useTaskCount() {
   return useReadContract({
@@ -40,10 +40,10 @@ export function useAgentCount() {
   })
 }
 
-export function useProtocolFee() {
+export function useProtocolFeeBps() {
   return useReadContract({
     ...AGENT_MARKET,
-    functionName: 'protocolFeeBps',
+    functionName: 'PROTOCOL_FEE_BPS',
     chainId: ARC_CHAIN_ID,
   })
 }

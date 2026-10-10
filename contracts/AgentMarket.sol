@@ -6,30 +6,42 @@ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+/// @title  AgentMarket
+/// @notice Agent-to-agent (A2A) task delegation with USDC escrow on Arc.
+///
+///   Protocol fee : 1% of every settled task budget (PROTOCOL_FEE_BPS = 100)
+///   Agent bond   : 50% of task budget locked for the duration of the task
+///   Dispute window: 24 hours after task completion
+///   Max task duration: 7 days from assignment (hard safety cap)
 contract AgentMarket is Ownable2Step, ReentrancyGuard {
-    uint256 public constant PROTOCOL_FEE_BPS = 200;
-    uint256 public constant BOND_BPS = 5000;
-    uint256 public constant MIN_REPUTATION = 0;
-    uint256 public constant MAX_REPUTATION = 100;
-    uint256 public constant REP_SUCCESS_DELTA = 2;
-    uint256 public constant REP_FAIL_DELTA = 8;
-    uint256 public constant DISPUTE_WINDOW_SECONDS = 120;
+    // ─── Constants ───────────────────────────────────────────────────────────
+    uint256 public constant PROTOCOL_FEE_BPS      = 100;          // 1 %
+    uint256 public constant BOND_BPS              = 5_000;         // 50 %
+    uint256 public constant MIN_REPUTATION        = 0;
+    uint256 public constant MAX_REPUTATION        = 100;
+    uint256 public constant REP_SUCCESS_DELTA     = 2;
+    uint256 public constant REP_FAIL_DELTA        = 8;
+    uint256 public constant DISPUTE_WINDOW_SECONDS = 86_400;       // 24 h  (fix #2)
+    uint256 public constant MAX_TASK_DURATION      = 7 days;       // fix #1
 
+    // ─── Immutables ──────────────────────────────────────────────────────────
     IERC20 public immutable usdc;
+    address public immutable feeRecipient;                          // fix #4
 
+    // ─── Data structures ─────────────────────────────────────────────────────
     struct Agent {
         uint256 id;
-        string name;
+        string  name;
         string[] capabilities;
         uint256 pricePerTask;
-        string endpoint;
+        string  endpoint;
         address owner;
         uint256 tasksCompleted;
         uint256 tasksFailed;
         uint256 reputation;
         uint256 bond;
         uint256 bondLocked;
-        bool active;
+        bool    active;
     }
 
     enum TaskStatus {
@@ -43,23 +55,25 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
     }
 
     struct Task {
-        uint256 id;
-        string title;
-        string description;
-        string capability;
-        uint256 budget;
-        address poster;
-        uint256 assignedAgentId;
+        uint256    id;
+        string     title;
+        string     description;
+        string     capability;
+        uint256    budget;
+        address    poster;
+        uint256    assignedAgentId;
         TaskStatus status;
-        uint256 agentBond;
-        uint256 createdAt;
-        uint256 deadlineTs;
-        bool bondSettled;
-        uint256 subAgentId;
-        uint256 subAgentCost;
-        uint256 completedAt;
+        uint256    agentBond;
+        uint256    createdAt;
+        uint256    deadlineTs;
+        bool       bondSettled;
+        uint256    subAgentId;
+        uint256    subAgentCost;
+        uint256    completedAt;
+        uint256    assignedAt;                                      // fix #1
     }
 
+    // ─── Errors ──────────────────────────────────────────────────────────────
     error ZeroAddress();
     error EmptyString();
     error EmptyCapabilities();
@@ -75,13 +89,17 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
     error InvalidSubAgent();
     error InvalidSubAgentCost();
     error DeadlineInPast();
-    error DeadlineNotReached();
-    error DisputeWindowPassed();
+    error DeadlinePassed();                                         // fix #6 (was DeadlineNotReached)
+    error DeadlineRequired();                                       // fix #1
+    error DisputeWindowNotPassed();                                 // fix #6 (was DisputeWindowPassed)
+    error DisputeWindowExpired();                                   // used in disputeTask
     error NoDisputeWindow();
     error BondAlreadySettled();
     error TransferFailed();
     error InsufficientContractBalance();
+    error PosterOwnsAgent();                                        // fix #8
 
+    // ─── Events ──────────────────────────────────────────────────────────────
     event AgentRegistered(uint256 indexed agentId, address indexed owner, string name);
     event BondStaked(uint256 indexed agentId, uint256 amount);
     event BondWithdrawn(uint256 indexed agentId, uint256 amount);
@@ -94,28 +112,38 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
         uint256 subAgentId,
         uint256 subAgentCost
     );
+    event TaskAccepted(uint256 indexed taskId);                     // fix #2
     event TaskFinalized(uint256 indexed taskId);
     event TaskDisputed(uint256 indexed taskId, address indexed poster, string reason);
     event DisputeResolved(uint256 indexed taskId, bool refundPoster);
     event TaskExpired(uint256 indexed taskId);
     event TaskCancelled(uint256 indexed taskId);
 
+    // ─── Storage ─────────────────────────────────────────────────────────────
     uint256 private _agentCounter;
     uint256 private _taskCounter;
 
-    mapping(uint256 => Agent) private _agents;
-    mapping(uint256 => Task) private _tasks;
+    mapping(uint256 => Agent)  private _agents;
+    mapping(uint256 => Task)   private _tasks;
 
     mapping(uint256 => mapping(bytes32 => bool)) private _agentHasCapability;
     mapping(bytes32 => uint256[]) private _agentsByCapability;
 
-    mapping(uint256 => bool) private _taskPaidOut;
+    mapping(uint256 => bool)    private _taskPaidOut;
     mapping(uint256 => uint256) private agentPendingBond;
 
-    constructor(address usdc_, address initialOwner) Ownable(initialOwner) {
-        if (usdc_ == address(0) || initialOwner == address(0)) revert ZeroAddress();
-        usdc = IERC20(usdc_);
+    // ─── Constructor ─────────────────────────────────────────────────────────
+    /// @param usdc_          ERC-20 USDC address
+    /// @param initialOwner   Contract owner / dispute arbitrator
+    /// @param feeRecipient_  Address that receives the 1% protocol fee    (fix #4)
+    constructor(address usdc_, address initialOwner, address feeRecipient_) Ownable(initialOwner) {
+        if (usdc_ == address(0) || initialOwner == address(0) || feeRecipient_ == address(0))
+            revert ZeroAddress();
+        usdc         = IERC20(usdc_);
+        feeRecipient = feeRecipient_;
     }
+
+    // ─── Agent management ────────────────────────────────────────────────────
 
     function registerAgent(
         string calldata name,
@@ -131,13 +159,13 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
         uint256 agentId = _agentCounter;
 
         Agent storage agent = _agents[agentId];
-        agent.id = agentId;
-        agent.name = name;
+        agent.id         = agentId;
+        agent.name       = name;
         agent.pricePerTask = pricePerTask;
-        agent.endpoint = endpoint;
-        agent.owner = msg.sender;
+        agent.endpoint   = endpoint;
+        agent.owner      = msg.sender;
         agent.reputation = 50;
-        agent.active = true;
+        agent.active     = true;
 
         for (uint256 i = 0; i < capabilities.length; i++) {
             _validateNonEmpty(capabilities[i]);
@@ -174,7 +202,7 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
 
         uint256 freeBond = agent.bond - agent.bondLocked;
         if (amount > freeBond) revert InsufficientFreeBond();
-        if (agent.bond - amount < _agentPendingBond(agentId)) revert InsufficientFreeBond();
+        if (agent.bond - amount < agentPendingBond[agentId]) revert InsufficientFreeBond();
 
         agent.bond -= amount;
         _transfer(msg.sender, amount);
@@ -182,6 +210,10 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
         emit BondWithdrawn(agentId, amount);
     }
 
+    // ─── Task lifecycle ──────────────────────────────────────────────────────
+
+    /// @notice Post a task and escrow the budget.
+    /// @param deadlineMs  Unix deadline in milliseconds — MUST be non-zero.   (fix #1)
     function postTask(
         string calldata title,
         string calldata description,
@@ -193,26 +225,24 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
         _validateNonEmpty(description);
         _validateNonEmpty(capability);
         if (budget == 0) revert InvalidAmount();
+        if (deadlineMs == 0) revert DeadlineRequired();             // fix #1: reject zero deadline
 
-        uint256 deadlineTs = 0;
-        if (deadlineMs > 0) {
-            deadlineTs = deadlineMs / 1000;
-            if (deadlineTs <= block.timestamp) revert DeadlineInPast();
-        }
+        uint256 deadlineTs = deadlineMs / 1000;
+        if (deadlineTs <= block.timestamp) revert DeadlineInPast();
 
         _taskCounter++;
         uint256 taskId = _taskCounter;
 
         Task storage task = _tasks[taskId];
-        task.id = taskId;
-        task.title = title;
+        task.id          = taskId;
+        task.title       = title;
         task.description = description;
-        task.capability = capability;
-        task.budget = budget;
-        task.poster = msg.sender;
-        task.status = TaskStatus.Open;
-        task.createdAt = block.timestamp;
-        task.deadlineTs = deadlineTs;
+        task.capability  = capability;
+        task.budget      = budget;
+        task.poster      = msg.sender;
+        task.status      = TaskStatus.Open;
+        task.createdAt   = block.timestamp;
+        task.deadlineTs  = deadlineTs;
 
         _transferFrom(msg.sender, address(this), budget);
 
@@ -226,27 +256,31 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
         Task storage task = _tasks[taskId];
         if (task.poster != msg.sender) revert NotTaskPoster();
         if (task.status != TaskStatus.Open) revert InvalidStatus();
-        if (task.deadlineTs > 0 && block.timestamp >= task.deadlineTs) revert DeadlineNotReached();
+        if (block.timestamp >= task.deadlineTs) revert DeadlinePassed(); // fix #6
 
         Agent storage agent = _agents[agentId];
         if (!agent.active) revert AgentInactive();
+        if (agent.owner == msg.sender) revert PosterOwnsAgent();    // fix #8
 
         bytes32 capHash = keccak256(bytes(task.capability));
         if (!_agentHasCapability[agentId][capHash]) revert CapabilityNotSupported();
 
         uint256 requiredBond = (task.budget * BOND_BPS) / 10_000;
-        uint256 freeBond = agent.bond - agent.bondLocked;
+        uint256 freeBond     = agent.bond - agent.bondLocked;
         if (freeBond < requiredBond) revert InsufficientFreeBond();
 
         agent.bondLocked += requiredBond;
 
         task.assignedAgentId = agentId;
-        task.agentBond = requiredBond;
-        task.status = TaskStatus.InProgress;
+        task.agentBond       = requiredBond;
+        task.status          = TaskStatus.InProgress;
+        task.assignedAt      = block.timestamp;                     // fix #1
 
         emit TaskAssigned(taskId, agentId, requiredBond);
     }
 
+    /// @notice Mark a task complete and record sub-agent.
+    ///         Payment is deferred until acceptTask or finalizeTask.
     function completeTask(uint256 taskId, uint256 subAgentId, uint256 subAgentCost) external nonReentrant {
         _ensureValidTask(taskId);
 
@@ -256,11 +290,14 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
         Agent storage mainAgent = _agents[task.assignedAgentId];
         if (mainAgent.owner != msg.sender) revert NotAgentOwner();
 
-        uint256 totalFee = (task.budget * PROTOCOL_FEE_BPS) / 10_000;
+        uint256 totalFee   = (task.budget * PROTOCOL_FEE_BPS) / 10_000;
         uint256 paidToAgent;
 
         if (subAgentId > 0) {
             _ensureValidAgent(subAgentId);
+            Agent storage sub = _agents[subAgentId];
+            if (!sub.active) revert AgentInactive();                // fix #7: sub-agent must be active
+            if (subAgentId == task.assignedAgentId) revert InvalidSubAgent(); // fix #7: no self-delegation
             if (subAgentCost == 0) revert InvalidSubAgentCost();
 
             uint256 maxSubPay = task.budget - totalFee;
@@ -268,16 +305,16 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
 
             paidToAgent = maxSubPay - subAgentCost;
 
-            task.subAgentId = subAgentId;
+            task.subAgentId   = subAgentId;
             task.subAgentCost = subAgentCost;
         } else {
             if (subAgentCost != 0) revert InvalidSubAgentCost();
-            paidToAgent = task.budget - totalFee;
-            task.subAgentId = 0;
+            paidToAgent       = task.budget - totalFee;
+            task.subAgentId   = 0;
             task.subAgentCost = 0;
         }
 
-        task.status = TaskStatus.Completed;
+        task.status      = TaskStatus.Completed;
         task.completedAt = block.timestamp;
         _taskPaidOut[taskId] = false;
         agentPendingBond[task.assignedAgentId] += task.agentBond;
@@ -288,6 +325,21 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
         emit TaskCompleted(taskId, task.assignedAgentId, paidToAgent, task.subAgentId, task.subAgentCost);
     }
 
+    /// @notice Poster explicitly accepts the result, paying out immediately    (fix #2)
+    ///         and skipping the rest of the dispute window.
+    function acceptTask(uint256 taskId) external nonReentrant {
+        _ensureValidTask(taskId);
+
+        Task storage task = _tasks[taskId];
+        if (task.poster != msg.sender) revert NotTaskPoster();
+        if (task.status != TaskStatus.Completed) revert InvalidStatus();
+
+        _settleTask(taskId, task);
+
+        emit TaskAccepted(taskId);
+    }
+
+    /// @notice Anyone can finalize after the 24-hour dispute window expires.
     function finalizeTask(uint256 taskId) external nonReentrant {
         _ensureValidTask(taskId);
 
@@ -297,28 +349,10 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
 
         uint256 completedAt = task.completedAt;
         if (completedAt == 0) revert NoDisputeWindow();
-        if (block.timestamp < completedAt + DISPUTE_WINDOW_SECONDS) revert DisputeWindowPassed();
+        // fix #6: was DisputeWindowPassed — the window must have passed to finalize
+        if (block.timestamp < completedAt + DISPUTE_WINDOW_SECONDS) revert DisputeWindowNotPassed();
 
-        Agent storage mainAgent = _agents[task.assignedAgentId];
-
-        uint256 totalFee = (task.budget * PROTOCOL_FEE_BPS) / 10_000;
-        uint256 paidToAgent;
-
-        if (task.subAgentId > 0) {
-            Agent storage subAgent = _agents[task.subAgentId];
-            uint256 maxSubPay = task.budget - totalFee;
-            paidToAgent = maxSubPay - task.subAgentCost;
-            _transfer(subAgent.owner, task.subAgentCost);
-        } else {
-            paidToAgent = task.budget - totalFee;
-        }
-
-        _transfer(mainAgent.owner, paidToAgent);
-        _transfer(owner(), totalFee);
-
-        _releaseAgentBond(task, mainAgent);
-        agentPendingBond[task.assignedAgentId] -= task.agentBond;
-        _taskPaidOut[taskId] = true;
+        _settleTask(taskId, task);
 
         emit TaskFinalized(taskId);
     }
@@ -333,7 +367,7 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
 
         uint256 completedAt = task.completedAt;
         if (completedAt == 0) revert NoDisputeWindow();
-        if (block.timestamp > completedAt + DISPUTE_WINDOW_SECONDS) revert DisputeWindowPassed();
+        if (block.timestamp > completedAt + DISPUTE_WINDOW_SECONDS) revert DisputeWindowExpired();
 
         task.status = TaskStatus.Disputed;
 
@@ -359,7 +393,7 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
                 agentPendingBond[task.assignedAgentId] -= task.agentBond;
             }
 
-            mainAgent.bond -= task.agentBond;
+            mainAgent.bond      -= task.agentBond;
             mainAgent.tasksFailed += 1;
             mainAgent.reputation = _decreaseReputation(mainAgent.reputation, REP_FAIL_DELTA);
 
@@ -369,24 +403,8 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
             _transfer(task.poster, task.agentBond);
         } else {
             if (!_taskPaidOut[taskId]) {
-                uint256 totalFee = (task.budget * PROTOCOL_FEE_BPS) / 10_000;
-                uint256 paidToAgent;
-
-                if (task.subAgentId > 0) {
-                    Agent storage subAgent = _agents[task.subAgentId];
-                    uint256 maxSubPay = task.budget - totalFee;
-                    paidToAgent = maxSubPay - task.subAgentCost;
-                    _transfer(subAgent.owner, task.subAgentCost);
-                } else {
-                    paidToAgent = task.budget - totalFee;
-                }
-
-                _transfer(mainAgent.owner, paidToAgent);
-                _transfer(owner(), totalFee);
-                _taskPaidOut[taskId] = true;
-            }
-
-            if (!task.bondSettled) {
+                _settleTask(taskId, task);
+            } else if (!task.bondSettled) {
                 _releaseAgentBond(task, mainAgent);
                 agentPendingBond[task.assignedAgentId] -= task.agentBond;
             }
@@ -402,7 +420,7 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
 
         Task storage task = _tasks[taskId];
         if (task.status != TaskStatus.Open) revert InvalidStatus();
-        if (task.deadlineTs == 0 || block.timestamp < task.deadlineTs) revert DeadlineNotReached();
+        if (task.deadlineTs == 0 || block.timestamp < task.deadlineTs) revert DeadlinePassed(); // fix #6
 
         task.status = TaskStatus.Expired;
         _transfer(task.poster, task.budget);
@@ -423,16 +441,22 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
         emit TaskCancelled(taskId);
     }
 
+    /// @notice Poster aborts an in-progress task after it misses its deadline  (fix #1)
+    ///         OR after MAX_TASK_DURATION since assignment (hard safety cap).
     function abortTask(uint256 taskId) external nonReentrant {
         _ensureValidTask(taskId);
 
         Task storage task = _tasks[taskId];
         if (task.poster != msg.sender) revert NotTaskPoster();
         if (task.status != TaskStatus.InProgress) revert InvalidStatus();
-        if (task.deadlineTs == 0 || block.timestamp < task.deadlineTs) revert DeadlineNotReached();
+
+        bool deadlineExpired  = task.deadlineTs > 0 && block.timestamp >= task.deadlineTs;
+        bool maxDurationHit   = task.assignedAt > 0 &&
+                                block.timestamp >= task.assignedAt + MAX_TASK_DURATION;
+
+        if (!deadlineExpired && !maxDurationHit) revert DeadlinePassed(); // fix #1 + fix #6
 
         Agent storage mainAgent = _agents[task.assignedAgentId];
-
         _releaseAgentBond(task, mainAgent);
         mainAgent.reputation = _decreaseReputation(mainAgent.reputation, REP_FAIL_DELTA);
 
@@ -441,6 +465,8 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
 
         emit TaskCancelled(taskId);
     }
+
+    // ─── Views ───────────────────────────────────────────────────────────────
 
     function getAgent(uint256 id) external view returns (Agent memory) {
         _ensureValidAgent(id);
@@ -452,33 +478,50 @@ contract AgentMarket is Ownable2Step, ReentrancyGuard {
         return _tasks[id];
     }
 
-    function agentCount() external view returns (uint256) {
-        return _agentCounter;
-    }
-
-    function taskCount() external view returns (uint256) {
-        return _taskCounter;
-    }
+    function agentCount() external view returns (uint256) { return _agentCounter; }
+    function taskCount()  external view returns (uint256) { return _taskCounter; }
 
     function getAgentsByCapability(string calldata capability) external view returns (uint256[] memory) {
         _validateNonEmpty(capability);
         return _agentsByCapability[keccak256(bytes(capability))];
     }
 
-    function _releaseAgentBond(Task storage task, Agent storage agent) internal {
+    // ─── Internal helpers ────────────────────────────────────────────────────
+
+    /// @dev Shared payout logic used by acceptTask, finalizeTask, and resolveDispute.
+    function _settleTask(uint256 taskId, Task storage task) internal {
         if (task.bondSettled) revert BondAlreadySettled();
-        agent.bondLocked -= task.agentBond;
-        task.bondSettled = true;
+
+        Agent storage mainAgent = _agents[task.assignedAgentId];
+        uint256 totalFee   = (task.budget * PROTOCOL_FEE_BPS) / 10_000;
+        uint256 paidToAgent;
+
+        if (task.subAgentId > 0) {
+            Agent storage subAgent = _agents[task.subAgentId];
+            uint256 maxSubPay = task.budget - totalFee;
+            paidToAgent = maxSubPay - task.subAgentCost;
+            _transfer(subAgent.owner, task.subAgentCost);
+        } else {
+            paidToAgent = task.budget - totalFee;
+        }
+
+        _transfer(mainAgent.owner, paidToAgent);
+        _transfer(feeRecipient, totalFee);                          // fix #4: fee to feeRecipient
+
+        _releaseAgentBond(task, mainAgent);
+        agentPendingBond[task.assignedAgentId] -= task.agentBond;
+        _taskPaidOut[taskId] = true;
     }
 
-    function _agentPendingBond(uint256 agentId) internal view returns (uint256) {
-        return agentPendingBond[agentId];
+    function _releaseAgentBond(Task storage task, Agent storage agent) internal {
+        if (task.bondSettled) revert BondAlreadySettled();
+        agent.bondLocked  -= task.agentBond;
+        task.bondSettled   = true;
     }
 
     function _increaseReputation(uint256 current, uint256 delta) internal pure returns (uint256) {
         uint256 next = current + delta;
-        if (next > MAX_REPUTATION) return MAX_REPUTATION;
-        return next;
+        return next > MAX_REPUTATION ? MAX_REPUTATION : next;
     }
 
     function _decreaseReputation(uint256 current, uint256 delta) internal pure returns (uint256) {

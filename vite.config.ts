@@ -12,6 +12,6 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 5173,
     strictPort: true,
-    allowedHosts: ['iuvma2p8v3g3fbo0uf3jb.preview.studio.arc.io'],
+    allowedHosts: true,
   },
 })
