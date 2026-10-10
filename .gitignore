@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+*.local
+lib/forge-std/
+lib/openzeppelin-contracts/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+.DS_Store
